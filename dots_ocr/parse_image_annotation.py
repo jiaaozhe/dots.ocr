@@ -4,6 +4,15 @@ from tqdm import tqdm
 from multiprocessing.pool import ThreadPool, Pool
 import argparse
 
+import base64
+import re
+import math
+import unicodedata
+import fitz
+import hashlib
+from typing import List, Dict, Any
+import io
+
 
 from dots_ocr.model.inference import inference_with_vllm
 from dots_ocr.utils.consts import image_extensions, MIN_PIXELS, MAX_PIXELS
@@ -166,7 +175,8 @@ class DotsOCRParser:
             response = self._inference_with_vllm(image, prompt)
         result = {'page_no': page_idx,
             "input_height": input_height,
-            "input_width": input_width
+            "input_width": input_width,
+            "image": image,
         }
         # if source == 'pdf':
         #     save_name = f"{save_name}_page_{page_idx}"
@@ -202,61 +212,28 @@ class DotsOCRParser:
                 # })
                 pass
             else:
-                # try:
-                #     image_with_layout = draw_layout_on_image(origin_image, cells)
-                # except Exception as e:
-                #     print(f"Error drawing layout on image: {e}")
-                #     image_with_layout = origin_image
 
-                # json_file_path = os.path.join(save_dir, f"{save_name}.json")
-                # with open(json_file_path, 'w', encoding="utf-8") as w:
-                #     json.dump(cells, w, ensure_ascii=False)
 
-                # TODO: add bbox info and croped image to result
+                # dd bbox info and croped image to result
                 for i, cell in enumerate(cells):
                     bbox = cell['bbox']
+                    if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:  # invalid bbox
+                        continue
                     cell["image"] = origin_image.crop((bbox[0], bbox[1], bbox[2], bbox[3]))
                 result.update({'cells': cells})
 
-                # image_layout_path = os.path.join(save_dir, f"{save_name}.jpg")
-                # image_with_layout.save(image_layout_path)
-                # result.update({
-                #     'layout_info_path': json_file_path,
-                #     'layout_image_path': image_layout_path,
-                # })
                 if prompt_mode != "prompt_layout_only_en":  # no text md when detection only
                     md_content = layoutjson2md(origin_image, cells, text_key='text')
                     result.update({
                         "md_content": md_content
                     })
-                    # md_content_no_hf = layoutjson2md(origin_image, cells, text_key='text', no_page_hf=True) # used for clean output or metric of omnidocbench、olmbench 
-                    # md_file_path = os.path.join(save_dir, f"{save_name}.md")
-                    # with open(md_file_path, "w", encoding="utf-8") as md_file:
-                    #     md_file.write(md_content)
-                    # md_nohf_file_path = os.path.join(save_dir, f"{save_name}_nohf.md")
-                    # with open(md_nohf_file_path, "w", encoding="utf-8") as md_file:
-                    #     md_file.write(md_content_no_hf)
-                    # result.update({
-                    #     'md_content_path': md_file_path,
-                    #     'md_content_nohf_path': md_nohf_file_path,
-                    # })
+
         else:
-            # image_layout_path = os.path.join(save_dir, f"{save_name}.jpg")
-            # origin_image.save(image_layout_path)
-            # result.update({
-            #     'layout_image_path': image_layout_path,
-            # })
 
             md_content = response
             result.update({
                 "md_content": md_content
             })
-            # md_file_path = os.path.join(save_dir, f"{save_name}.md")
-            # with open(md_file_path, "w", encoding="utf-8") as md_file:
-            #     md_file.write(md_content)
-            # result.update({
-            #     'md_content_path': md_file_path,
-            # })
 
         return result
     
@@ -318,17 +295,188 @@ class DotsOCRParser:
             results = self.parse_image(input_path, prompt_mode, bbox=bbox, fitz_preprocess=fitz_preprocess)
         else:
             raise ValueError(f"file extension {file_ext} not supported, supported extensions are {image_extensions} and pdf")
-        
-        # print(f"Parsing finished, results saving to {save_dir}")
-        # with open(os.path.join(output_dir, os.path.basename(filename)+'.jsonl'), 'w', encoding="utf-8") as w:
-        #     for result in results:
-        #         w.write(json.dumps(result, ensure_ascii=False) + '\n')
 
         return results
     
     def batch_parse_images(self):
         pass
 
+
+class DotsOCRImageParser:
+    def __init__(self):
+        self.image_info = []
+
+    def get_result(self):
+        # return self.image_info
+        for item in self.image_info:
+            pillow_image = item.pop('image')
+            image_ext = pillow_image.format.lower() if pillow_image.format else 'png'
+            buffer = io.BytesIO()
+            pillow_image.save(buffer, format=image_ext.upper())
+            image_bytes = buffer.getvalue()
+            item['image_base64'] = base64.b64encode(image_bytes).decode('utf-8')
+            item['page_index'] = item.pop('page_no') + 1
+            item['image_md5'] = hashlib.md5(pillow_image.tobytes()).hexdigest()
+            item['image_name'] = f"page_{item['page_index']}_{item['caption']}_{item['image_md5']}.{image_ext}"
+
+        return self.image_info
+
+    def _rect_metrics(self, image_bbox, text_bbox):
+        """计算矩形关系与距离"""
+        image_left, image_top, image_right, image_bottom = image_bbox
+        text_left, text_top, text_right, text_bottom = text_bbox
+
+        image_center_x = (image_left + image_right) / 2
+        image_center_y = (image_top + image_bottom) / 2
+        text_center_x = (text_left + text_right) / 2
+        text_center_y = (text_top + text_bottom) / 2
+
+        image_width = image_right - image_left
+        image_height = image_bottom - image_top
+
+        distance = float('inf')
+
+        # ====== 方向关系 ======
+        relation = "other"
+        if text_top >= image_bottom:  # 只保留 below
+            # relation = "below"
+            if text_center_x >= image_left and text_center_x <= image_right:
+                relation = "below_center"
+                distance = text_top - image_bottom + image_height / 2
+            else:
+                relation = "below_offside"
+                distance = text_top - image_bottom + image_height / 2 + min(
+                    abs(text_center_x - image_left), abs(text_center_x - image_right)
+                )
+        elif text_bottom <= image_top:
+            relation = "above"
+            distance = image_top - text_bottom + image_height / 2
+        elif text_right <= image_left:
+            relation = "left"
+            distance = image_left - text_right + image_width / 2
+        elif text_left >= image_right:
+            relation = "right"
+            distance = text_left - image_right + image_width / 2
+        # else:
+        #     if text_center_y > image_center_y:
+        #         relation = "overlap_below"
+        #     else:
+        #         relation = "overlap_above"
+
+        return distance, relation
+
+    def extract_image_captions(self, results):
+        """
+        从results中提取图像及其对应的图注
+        """
+        for result in results:
+            if 'cells' in result:
+                cells = result['cells']
+                image_cells = self.extract_single_page_image_captions(cells)
+                self.image_info.extend(image_cells)
+        return self
+
+    def extract_single_page_image_captions(self, cells):
+        """
+        从cells中提取图像及其对应的图注
+        """
+        new_image_cells = []
+        image_cells = [cell for cell in cells if cell.get('category') == 'Picture']
+        caption_cells = [cell for cell in cells if cell.get('category') == 'Caption']
+        for image_cell in image_cells:
+            caption = self.extract_single_image_caption(image_cell, caption_cells)
+            if caption:
+                image_cell['caption'] = caption
+                new_image_cells.append(image_cell)
+        return new_image_cells
+
+    def extract_single_image_caption(self, image_cell: Dict, caption_cells: List[Dict]) -> str:
+
+        image = image_cell.get('image', None)
+        if image is None:
+            return None
+        image_bbox = image_cell['bbox']
+        image_left, image_top, image_right, image_bottom = image_bbox
+        image_width = image_right - image_left
+        image_height = image_bottom - image_top
+        caption_candidates = []
+        for caption_cell in caption_cells:
+            caption = caption_cell.get('md_content', None)
+            if caption is None:
+                continue
+            caption_bbox = caption_cell['bbox']
+            distance, relation = self._rect_metrics(image_bbox, caption_bbox)
+            # 方向权重
+            distance_weight = {
+                "below_center": 1,
+                "below_offside": 1.1,
+                "left": 1.1,
+                "right": 1.1,
+                "above": 2,
+            }.get(relation, 10)
+
+            # 打分
+            if relation in ["left", "right"]:
+                distance = distance / (
+                    image_width / 2
+                )  # 水平距离相对于图像宽度归一化
+            else:
+                distance = distance / (
+                    image_height / 2
+                )  # 垂直距离相对于图像高度归一化
+            score = distance * distance_weight
+
+            caption_candidates.append(
+                {
+                    "caption": caption,
+                    "bbox": caption_bbox,
+                    "relation": relation,
+                    "score": score,
+                }
+            )
+        # 如果没有找到任何图注，返回空字符串
+        if not caption_candidates:
+            return None
+        # 按距离评分排序，选择最合适的图注
+        caption_candidates.sort(key=lambda x: x["score"])
+        # 只返回距离图像较近的图注（在合理范围内）
+        closest_caption = caption_candidates[0]
+        # 设置距离阈值（页面高度的25%）
+        distance_threshold = 1.3
+        if closest_caption["score"] <= distance_threshold:
+            # 生成坐标信息字符串
+            # coord_info = f"position: {closest_caption['relation']})"
+            return closest_caption["caption"]
+        else:
+            return None
+
+    def clean_pdf_captions(self, text: str) -> str:
+        """
+        清理从 PDF 提取的图注：
+        1. 把各种 Unicode 空格（全角空格、em space、en space 等）统一为半角空格
+        2. 去掉零宽字符（如 \u200b, \u200c, \u200d）
+        3. 去掉控制符（如 \u2028, \u2029）
+        4. 合并连续空格为一个
+        """
+        cleaned = []
+        for ch in text:
+            cat = unicodedata.category(ch)
+            if cat == "Zs":
+                # 所有空格类 → 统一成普通半角空格
+                cleaned.append(" ")
+            elif ch in ["\u200b", "\u200c", "\u200d", "\ufeff"]:
+                # 零宽空格、BOM → 丢弃
+                continue
+            elif ch in ["\u2028", "\u2029"]:
+                # 行分隔符、段落分隔符 → 统一成换行
+                cleaned.append("\n")
+            else:
+                cleaned.append(ch)
+
+        result = "".join(cleaned)
+        # 合并多余空格
+        result = re.sub(r"[ ]{2,}", " ", result)
+        return result.strip()
 
 
 def main():
@@ -457,12 +605,24 @@ def main():
                 ocr_results = dots_ocr_parser.parse_image(
                     image, 
                     prompt_mode="prompt_ocr",
-                    bbox=args.bbox,
+                    bbox=None,
                     fitz_preprocess=fitz_preprocess,
                     )
                 md_content = ocr_results[0].get('md_content', '')
+                print(f"page: {result['page_no']+1}, caption: {md_content}")
                 cell['md_content'] = md_content
-    print(results)
+    # print(results)
+    dots_ocr_image_parser = DotsOCRImageParser()
+    image_info = dots_ocr_image_parser.extract_image_captions(results).get_result()
+
+    os.makedirs(args.output, exist_ok=True)
+    for image_item in image_info:
+        image_base64 = image_item.pop('image_base64')
+        image_bytes = base64.b64decode(image_base64)
+        image_name = image_item.pop('image_name')
+        image_path = os.path.join(args.output, image_name)
+        with open(image_path, 'wb') as f:
+            f.write(image_bytes)
 
 
 if __name__ == "__main__":
