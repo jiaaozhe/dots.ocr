@@ -305,6 +305,10 @@ class DotsOCRParser:
 class DotsOCRImageParser:
     def __init__(self):
         self.image_info = []
+    
+    def safe_filename(self, name: str) -> str:
+    # 把不允许的字符替换成下划线
+        return re.sub(r'[\/:*?"<>|]', '_', name)
 
     def get_result(self):
         # return self.image_info
@@ -317,7 +321,7 @@ class DotsOCRImageParser:
             item['image_base64'] = base64.b64encode(image_bytes).decode('utf-8')
             item['page_index'] = item.pop('page_no') + 1
             item['image_md5'] = hashlib.md5(pillow_image.tobytes()).hexdigest()
-            item['image_name'] = f"page_{item['page_index']}_{item['caption']}_{item['image_md5']}.{image_ext}"
+            item['image_name'] = f"page_{item['page_index']}_{self.safe_filename(item['caption'])}_{item['image_md5']}.{image_ext}"
 
         return self.image_info
 
@@ -349,19 +353,28 @@ class DotsOCRImageParser:
                     abs(text_center_x - image_left), abs(text_center_x - image_right)
                 )
         elif text_bottom <= image_top:
-            relation = "above"
-            distance = image_top - text_bottom + image_height / 2
+            if text_center_x >= image_left and text_center_x <= image_right:
+                relation = "above_center"
+                distance = image_top - text_bottom + image_height / 2
+            else:
+                relation = "above_offside"
+                distance = image_top - text_bottom + image_height / 2 + min(
+                    abs(text_center_x - image_left), abs(text_center_x - image_right)
+                )
         elif text_right <= image_left:
             relation = "left"
             distance = image_left - text_right + image_width / 2
         elif text_left >= image_right:
             relation = "right"
             distance = text_left - image_right + image_width / 2
-        # else:
-        #     if text_center_y > image_center_y:
-        #         relation = "overlap_below"
-        #     else:
-        #         relation = "overlap_above"
+        elif text_right > image_left and text_left < image_right and text_bottom > image_top and text_top < image_bottom:
+            relation = "overlap"
+            distance = min(
+                abs(text_center_x - image_left),
+                abs(image_right - text_center_x),
+                abs(text_center_y - image_top),
+                abs(image_bottom - text_center_y),
+            )
 
         return distance, relation
 
@@ -399,6 +412,12 @@ class DotsOCRImageParser:
         image_left, image_top, image_right, image_bottom = image_bbox
         image_width = image_right - image_left
         image_height = image_bottom - image_top
+        if image_width <= 50 or image_height <= 50:
+            # 过滤掉过小的图片
+            return None
+        if min(image_width, image_height) / max(image_width, image_height) < 0.2:
+            # 过滤掉过于狭长的图片
+            return None
         caption_candidates = []
         for caption_cell in caption_cells:
             caption = caption_cell.get('md_content', None)
@@ -408,11 +427,13 @@ class DotsOCRImageParser:
             distance, relation = self._rect_metrics(image_bbox, caption_bbox)
             # 方向权重
             distance_weight = {
-                "below_center": 1,
-                "below_offside": 1.1,
-                "left": 1.1,
-                "right": 1.1,
-                "above": 2,
+                "below_center": 1.1,
+                "below_offside": 1.2,
+                "overlap": 1.2,
+                "left": 1.2,
+                "right": 1.2,
+                "above_center": 1.1,
+                "above_offside": 2,
             }.get(relation, 10)
 
             # 打分
@@ -480,11 +501,9 @@ class DotsOCRImageParser:
 
 
 def main():
-    prompts = list(dict_promptmode_to_prompt.keys())
     parser = argparse.ArgumentParser(
         description="dots.ocr Multilingual Document Layout Parser",
     )
-    
     parser.add_argument(
         "input_path", type=str,
         help="Input PDF/image file path"
@@ -494,84 +513,38 @@ def main():
         "--output", type=str, default="./output",
         help="Output directory (default: ./output)"
     )
-    
-    parser.add_argument(
-        "--prompt", choices=prompts, type=str, default="prompt_layout_only_en",
-        help="prompt to query the model, different prompts for different tasks"
-    )
-    parser.add_argument(
-        '--bbox', 
-        type=int, 
-        nargs=4, 
-        metavar=('x1', 'y1', 'x2', 'y2'),
-        help='should give this argument if you want to prompt_grounding_ocr'
-    )
-    parser.add_argument(
-        "--ip", type=str, default="localhost",
-        help=""
-    )
-    parser.add_argument(
-        "--port", type=int, default=8000,
-        help=""
-    )
-    parser.add_argument(
-        "--model_name", type=str, default="model",
-        help=""
-    )
-    parser.add_argument(
-        "--temperature", type=float, default=0.1,
-        help=""
-    )
-    parser.add_argument(
-        "--top_p", type=float, default=1.0,
-        help=""
-    )
-    parser.add_argument(
-        "--dpi", type=int, default=200,
-        help=""
-    )
-    parser.add_argument(
-        "--max_completion_tokens", type=int, default=16384,
-        help=""
-    )
-    parser.add_argument(
-        "--num_thread", type=int, default=16,
-        help=""
-    )
-    parser.add_argument(
-        "--no_fitz_preprocess", action='store_true',
-        help="False will use tikz dpi upsample pipeline, good for images which has been render with low dpi, but maybe result in higher computational costs"
-    )
-    parser.add_argument(
-        "--min_pixels", type=int, default=None,
-        help=""
-    )
-    parser.add_argument(
-        "--max_pixels", type=int, default=None,
-        help=""
-    )
-    parser.add_argument(
-        "--use_hf", type=bool, default=False,
-        help=""
-    )
     args = parser.parse_args()
 
+    # dots_ocr_parser = DotsOCRParser(
+    #     ip=args.ip,
+    #     port=args.port,
+    #     model_name=args.model_name,
+    #     temperature=args.temperature,
+    #     top_p=args.top_p,
+    #     max_completion_tokens=args.max_completion_tokens,
+    #     num_thread=args.num_thread,
+    #     dpi=args.dpi,
+    #     output_dir=args.output, 
+    #     min_pixels=args.min_pixels,
+    #     max_pixels=args.max_pixels,
+    #     use_hf=args.use_hf,
+    # )
     dots_ocr_parser = DotsOCRParser(
-        ip=args.ip,
-        port=args.port,
-        model_name=args.model_name,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        max_completion_tokens=args.max_completion_tokens,
-        num_thread=args.num_thread,
-        dpi=args.dpi,
-        output_dir=args.output, 
-        min_pixels=args.min_pixels,
-        max_pixels=args.max_pixels,
-        use_hf=args.use_hf,
+        ip="localhost",
+        port=8000,
+        model_name="model",
+        temperature=0.1,
+        top_p=1.0,
+        max_completion_tokens=16384,
+        num_thread=16,
+        dpi=300,
+        output_dir="./output", 
+        min_pixels=None,
+        max_pixels=None,
+        use_hf=False,
     )
 
-    fitz_preprocess = not args.no_fitz_preprocess
+    fitz_preprocess = True
     if fitz_preprocess:
         print(f"Using fitz preprocess for image input, check the change of the image pixels")
     results = dots_ocr_parser.parse_file(
