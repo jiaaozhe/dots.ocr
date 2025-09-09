@@ -1,25 +1,25 @@
 import os
-import json
 from tqdm import tqdm
-from multiprocessing.pool import ThreadPool, Pool
+from multiprocessing.pool import ThreadPool
 import argparse
 
 import base64
 import re
-import math
 import unicodedata
-import fitz
 import hashlib
-from typing import List, Dict, Any
+from typing import List, Dict
 import io
 
 
 from dots_ocr.model.inference import inference_with_vllm
 from dots_ocr.utils.consts import image_extensions, MIN_PIXELS, MAX_PIXELS
 from dots_ocr.utils.image_utils import get_image_by_fitz_doc, fetch_image, smart_resize
-from dots_ocr.utils.doc_utils import fitz_doc_to_image, load_images_from_pdf
+from dots_ocr.utils.doc_utils import load_images_from_pdf
 from dots_ocr.utils.prompts import dict_promptmode_to_prompt
-from dots_ocr.utils.layout_utils import post_process_output, draw_layout_on_image, pre_process_bboxes
+from dots_ocr.utils.layout_utils import (
+    post_process_output,
+    pre_process_bboxes,
+)
 from dots_ocr.utils.format_transformer import layoutjson2md
 
 
@@ -27,21 +27,22 @@ class DotsOCRParser:
     """
     parse image or pdf file
     """
-    
-    def __init__(self, 
-            ip='localhost',
-            port=8000,
-            model_name='model',
-            temperature=0.1,
-            top_p=1.0,
-            max_completion_tokens=16384,
-            num_thread=64,
-            dpi = 200, 
-            output_dir="./output", 
-            min_pixels=None,
-            max_pixels=None,
-            use_hf=False,
-        ):
+
+    def __init__(
+        self,
+        ip="localhost",
+        port=8000,
+        model_name="model",
+        temperature=0.1,
+        top_p=1.0,
+        max_completion_tokens=16384,
+        num_thread=64,
+        dpi=200,
+        output_dir="./output",
+        min_pixels=None,
+        max_pixels=None,
+        use_hf=False,
+    ):
         self.dpi = dpi
 
         # default args for vllm server
@@ -60,7 +61,7 @@ class DotsOCRParser:
         self.use_hf = use_hf
         if self.use_hf:
             self._load_hf_model()
-            print(f"use hf model, num_thread will be set to 1")
+            print("use hf model, num_thread will be set to 1")
         else:
             print(f"use vllm model, num_thread will be set to {self.num_thread}")
         assert self.min_pixels is None or self.min_pixels >= MIN_PIXELS
@@ -68,7 +69,7 @@ class DotsOCRParser:
 
     def _load_hf_model(self):
         import torch
-        from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+        from transformers import AutoModelForCausalLM, AutoProcessor
         from qwen_vl_utils import process_vision_info
 
         model_path = "./weights/DotsOCR"
@@ -77,9 +78,11 @@ class DotsOCRParser:
             attn_implementation="flash_attention_2",
             torch_dtype=torch.bfloat16,
             device_map="auto",
-            trust_remote_code=True
+            trust_remote_code=True,
         )
-        self.processor = AutoProcessor.from_pretrained(model_path,  trust_remote_code=True,use_fast=True)
+        self.processor = AutoProcessor.from_pretrained(
+            model_path, trust_remote_code=True, use_fast=True
+        )
         self.process_vision_info = process_vision_info
 
     def _inference_with_hf(self, image, prompt):
@@ -87,20 +90,15 @@ class DotsOCRParser:
             {
                 "role": "user",
                 "content": [
-                    {
-                        "type": "image",
-                        "image": image
-                    },
-                    {"type": "text", "text": prompt}
-                ]
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt},
+                ],
             }
         ]
 
         # Preparation for inference
         text = self.processor.apply_chat_template(
-            messages, 
-            tokenize=False, 
-            add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True
         )
         image_inputs, video_inputs = self.process_vision_info(messages)
         inputs = self.processor(
@@ -116,17 +114,20 @@ class DotsOCRParser:
         # Inference: Generation of the output
         generated_ids = self.model.generate(**inputs, max_new_tokens=24000)
         generated_ids_trimmed = [
-            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            out_ids[len(in_ids) :]
+            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
         response = self.processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
         )[0]
         return response
 
     def _inference_with_vllm(self, image, prompt):
         response = inference_with_vllm(
             image,
-            prompt, 
+            prompt,
             model_name=self.model_name,
             ip=self.ip,
             port=self.port,
@@ -136,113 +137,127 @@ class DotsOCRParser:
         )
         return response
 
-    def get_prompt(self, prompt_mode, bbox=None, origin_image=None, image=None, min_pixels=None, max_pixels=None):
+    def get_prompt(
+        self,
+        prompt_mode,
+        bbox=None,
+        origin_image=None,
+        image=None,
+        min_pixels=None,
+        max_pixels=None,
+    ):
         prompt = dict_promptmode_to_prompt[prompt_mode]
-        if prompt_mode == 'prompt_grounding_ocr':
+        if prompt_mode == "prompt_grounding_ocr":
             assert bbox is not None
             bboxes = [bbox]
-            bbox = pre_process_bboxes(origin_image, bboxes, input_width=image.width, input_height=image.height, min_pixels=min_pixels, max_pixels=max_pixels)[0]
+            bbox = pre_process_bboxes(
+                origin_image,
+                bboxes,
+                input_width=image.width,
+                input_height=image.height,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+            )[0]
             prompt = prompt + str(bbox)
         return prompt
 
     # def post_process_results(self, response, prompt_mode, save_dir, save_name, origin_image, image, min_pixels, max_pixels)
     def _parse_single_image(
-        self, 
-        origin_image, 
-        prompt_mode, 
-        source="image", 
-        page_idx=0, 
+        self,
+        origin_image,
+        prompt_mode,
+        source="image",
+        page_idx=0,
         bbox=None,
         fitz_preprocess=False,
-        ):
+    ):
         min_pixels, max_pixels = self.min_pixels, self.max_pixels
         if prompt_mode == "prompt_grounding_ocr":
             min_pixels = min_pixels or MIN_PIXELS  # preprocess image to the final input
             max_pixels = max_pixels or MAX_PIXELS
-        if min_pixels is not None: assert min_pixels >= MIN_PIXELS, f"min_pixels should >= {MIN_PIXELS}"
-        if max_pixels is not None: assert max_pixels <= MAX_PIXELS, f"max_pixels should <+ {MAX_PIXELS}"
+        if min_pixels is not None:
+            assert min_pixels >= MIN_PIXELS, f"min_pixels should >= {MIN_PIXELS}"
+        if max_pixels is not None:
+            assert max_pixels <= MAX_PIXELS, f"max_pixels should <+ {MAX_PIXELS}"
 
-        if source == 'image' and fitz_preprocess:
+        if source == "image" and fitz_preprocess:
             image = get_image_by_fitz_doc(origin_image, target_dpi=self.dpi)
             image = fetch_image(image, min_pixels=min_pixels, max_pixels=max_pixels)
         else:
-            image = fetch_image(origin_image, min_pixels=min_pixels, max_pixels=max_pixels)
+            image = fetch_image(
+                origin_image, min_pixels=min_pixels, max_pixels=max_pixels
+            )
         input_height, input_width = smart_resize(image.height, image.width)
-        prompt = self.get_prompt(prompt_mode, bbox, origin_image, image, min_pixels=min_pixels, max_pixels=max_pixels)
+        prompt = self.get_prompt(
+            prompt_mode,
+            bbox,
+            origin_image,
+            image,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
         if self.use_hf:
             response = self._inference_with_hf(image, prompt)
         else:
             response = self._inference_with_vllm(image, prompt)
-        result = {'page_no': page_idx,
+        result = {
+            "page_no": page_idx,
             "input_height": input_height,
             "input_width": input_width,
             "image": image,
         }
-        # if source == 'pdf':
-        #     save_name = f"{save_name}_page_{page_idx}"
-        if prompt_mode in ['prompt_layout_all_en', 'prompt_layout_only_en', 'prompt_grounding_ocr']:
+        if prompt_mode in [
+            "prompt_layout_all_en",
+            "prompt_layout_only_en",
+            "prompt_grounding_ocr",
+        ]:
             cells, filtered = post_process_output(
-                response, 
-                prompt_mode, 
-                origin_image, 
+                response,
+                prompt_mode,
+                origin_image,
                 image,
-                min_pixels=min_pixels, 
+                min_pixels=min_pixels,
                 max_pixels=max_pixels,
-                )
-            if filtered and prompt_mode != 'prompt_layout_only_en':  # model output json failed, use filtered process
-                # json_file_path = os.path.join(save_dir, f"{save_name}.json")
-                # with open(json_file_path, 'w', encoding="utf-8") as w:
-                #     json.dump(response, w, ensure_ascii=False)
-
-                # image_layout_path = os.path.join(save_dir, f"{save_name}.jpg")
-                # origin_image.save(image_layout_path)
-                # result.update({
-                #     'layout_info_path': json_file_path,
-                #     'layout_image_path': image_layout_path,
-                # })
-
-                # md_file_path = os.path.join(save_dir, f"{save_name}.md")
-                # with open(md_file_path, "w", encoding="utf-8") as md_file:
-                #     md_file.write(cells)
-                # result.update({
-                #     'md_content_path': md_file_path
-                # })
-                # result.update({
-                #     'filtered': True
-                # })
+            )
+            if (
+                filtered and prompt_mode != "prompt_layout_only_en"
+            ):  # model output json failed, use filtered process
                 pass
             else:
-
-
                 # dd bbox info and croped image to result
                 for i, cell in enumerate(cells):
-                    bbox = cell['bbox']
+                    bbox = cell["bbox"]
                     if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:  # invalid bbox
                         continue
-                    cell["image"] = origin_image.crop((bbox[0], bbox[1], bbox[2], bbox[3]))
-                result.update({'cells': cells})
+                    cell["image"] = origin_image.crop(
+                        (bbox[0], bbox[1], bbox[2], bbox[3])
+                    )
+                result.update({"cells": cells})
 
-                if prompt_mode != "prompt_layout_only_en":  # no text md when detection only
-                    md_content = layoutjson2md(origin_image, cells, text_key='text')
-                    result.update({
-                        "md_content": md_content
-                    })
+                if (
+                    prompt_mode != "prompt_layout_only_en"
+                ):  # no text md when detection only
+                    md_content = layoutjson2md(origin_image, cells, text_key="text")
+                    result.update({"md_content": md_content})
 
         else:
-
             md_content = response
-            result.update({
-                "md_content": md_content
-            })
+            result.update({"md_content": md_content})
 
         return result
-    
+
     def parse_image(self, input_path, prompt_mode, bbox=None, fitz_preprocess=False):
         origin_image = fetch_image(input_path)
-        result = self._parse_single_image(origin_image, prompt_mode, source="image", bbox=bbox, fitz_preprocess=fitz_preprocess)
+        result = self._parse_single_image(
+            origin_image,
+            prompt_mode,
+            source="image",
+            bbox=bbox,
+            fitz_preprocess=fitz_preprocess,
+        )
         # result['file_path'] = input_path
         return [result]
-        
+
     def parse_pdf(self, input_path, prompt_mode):
         print(f"loading pdf: {input_path}")
         images_origin = load_images_from_pdf(input_path, dpi=self.dpi)
@@ -251,16 +266,17 @@ class DotsOCRParser:
             {
                 "origin_image": image,
                 "prompt_mode": prompt_mode,
-                "source":"pdf",
+                "source": "pdf",
                 "page_idx": i,
-            } for i, image in enumerate(images_origin)
+            }
+            for i, image in enumerate(images_origin)
         ]
 
         def _execute_task(task_args):
             return self._parse_single_image(**task_args)
 
         if self.use_hf:
-            num_thread =  1
+            num_thread = 1
         else:
             num_thread = min(total_pages, self.num_thread)
         print(f"Parsing PDF with {total_pages} pages using {num_thread} threads...")
@@ -277,27 +293,32 @@ class DotsOCRParser:
         #     results[i]['file_path'] = input_path
         return results
 
-    def parse_file(self, 
+    def parse_file(
+        self,
         input_path,
         prompt_mode="prompt_layout_all_en",
         bbox=None,
-        fitz_preprocess=False
-        ):
+        fitz_preprocess=False,
+    ):
         # output_dir = output_dir or self.output_dir
         # output_dir = os.path.abspath(output_dir)
         filename, file_ext = os.path.splitext(os.path.basename(input_path))
         # save_dir = os.path.join(output_dir, filename)
         # os.makedirs(save_dir, exist_ok=True)
 
-        if file_ext == '.pdf':
+        if file_ext == ".pdf":
             results = self.parse_pdf(input_path, prompt_mode)
         elif file_ext in image_extensions:
-            results = self.parse_image(input_path, prompt_mode, bbox=bbox, fitz_preprocess=fitz_preprocess)
+            results = self.parse_image(
+                input_path, prompt_mode, bbox=bbox, fitz_preprocess=fitz_preprocess
+            )
         else:
-            raise ValueError(f"file extension {file_ext} not supported, supported extensions are {image_extensions} and pdf")
+            raise ValueError(
+                f"file extension {file_ext} not supported, supported extensions are {image_extensions} and pdf"
+            )
 
         return results
-    
+
     def batch_parse_images(self):
         pass
 
@@ -305,23 +326,25 @@ class DotsOCRParser:
 class DotsOCRImageParser:
     def __init__(self):
         self.image_info = []
-    
+
     def safe_filename(self, name: str) -> str:
-    # 把不允许的字符替换成下划线
-        return re.sub(r'[\/:*?"<>|]', '_', name)
+        # 把不允许的字符替换成下划线
+        return re.sub(r'[\/:*?"<>|]', "_", name)
 
     def get_result(self):
         # return self.image_info
         for item in self.image_info:
-            pillow_image = item.pop('image')
-            image_ext = pillow_image.format.lower() if pillow_image.format else 'png'
+            pillow_image = item.pop("image")
+            image_ext = pillow_image.format.lower() if pillow_image.format else "png"
             buffer = io.BytesIO()
             pillow_image.save(buffer, format=image_ext.upper())
             image_bytes = buffer.getvalue()
-            item['image_base64'] = base64.b64encode(image_bytes).decode('utf-8')
-            item['page_index'] = item.pop('page_no') + 1
-            item['image_md5'] = hashlib.md5(pillow_image.tobytes()).hexdigest()
-            item['image_name'] = f"page_{item['page_index']}_{self.safe_filename(item['caption'])}_{item['image_md5']}.{image_ext}"
+            item["image_base64"] = base64.b64encode(image_bytes).decode("utf-8")
+            item["page_index"] = item.pop("page_no") + 1
+            item["image_md5"] = hashlib.md5(pillow_image.tobytes()).hexdigest()
+            item["image_name"] = (
+                f"page_{item['page_index']}_{self.safe_filename(item['caption'])}_{item['image_md5']}.{image_ext}"
+            )
 
         return self.image_info
 
@@ -330,15 +353,13 @@ class DotsOCRImageParser:
         image_left, image_top, image_right, image_bottom = image_bbox
         text_left, text_top, text_right, text_bottom = text_bbox
 
-        image_center_x = (image_left + image_right) / 2
-        image_center_y = (image_top + image_bottom) / 2
         text_center_x = (text_left + text_right) / 2
         text_center_y = (text_top + text_bottom) / 2
 
         image_width = image_right - image_left
         image_height = image_bottom - image_top
 
-        distance = float('inf')
+        distance = float("inf")
 
         # ====== 方向关系 ======
         relation = "other"
@@ -349,8 +370,14 @@ class DotsOCRImageParser:
                 distance = text_top - image_bottom + image_height / 2
             else:
                 relation = "below_offside"
-                distance = text_top - image_bottom + image_height / 2 + min(
-                    abs(text_center_x - image_left), abs(text_center_x - image_right)
+                distance = (
+                    text_top
+                    - image_bottom
+                    + image_height / 2
+                    + min(
+                        abs(text_center_x - image_left),
+                        abs(text_center_x - image_right),
+                    )
                 )
         elif text_bottom <= image_top:
             if text_center_x >= image_left and text_center_x <= image_right:
@@ -358,8 +385,14 @@ class DotsOCRImageParser:
                 distance = image_top - text_bottom + image_height / 2
             else:
                 relation = "above_offside"
-                distance = image_top - text_bottom + image_height / 2 + min(
-                    abs(text_center_x - image_left), abs(text_center_x - image_right)
+                distance = (
+                    image_top
+                    - text_bottom
+                    + image_height / 2
+                    + min(
+                        abs(text_center_x - image_left),
+                        abs(text_center_x - image_right),
+                    )
                 )
         elif text_right <= image_left:
             relation = "left"
@@ -367,7 +400,12 @@ class DotsOCRImageParser:
         elif text_left >= image_right:
             relation = "right"
             distance = text_left - image_right + image_width / 2
-        elif text_right > image_left and text_left < image_right and text_bottom > image_top and text_top < image_bottom:
+        elif (
+            text_right > image_left
+            and text_left < image_right
+            and text_bottom > image_top
+            and text_top < image_bottom
+        ):
             relation = "overlap"
             distance = min(
                 abs(text_center_x - image_left),
@@ -383,8 +421,8 @@ class DotsOCRImageParser:
         从results中提取图像及其对应的图注
         """
         for result in results:
-            if 'cells' in result:
-                cells = result['cells']
+            if "cells" in result:
+                cells = result["cells"]
                 image_cells = self.extract_single_page_image_captions(cells)
                 self.image_info.extend(image_cells)
         return self
@@ -394,21 +432,22 @@ class DotsOCRImageParser:
         从cells中提取图像及其对应的图注
         """
         new_image_cells = []
-        image_cells = [cell for cell in cells if cell.get('category') == 'Picture']
-        caption_cells = [cell for cell in cells if cell.get('category') == 'Caption']
+        image_cells = [cell for cell in cells if cell.get("category") == "Picture"]
+        caption_cells = [cell for cell in cells if cell.get("category") == "Caption"]
         for image_cell in image_cells:
             caption = self.extract_single_image_caption(image_cell, caption_cells)
             if caption:
-                image_cell['caption'] = caption
+                image_cell["caption"] = caption
                 new_image_cells.append(image_cell)
         return new_image_cells
 
-    def extract_single_image_caption(self, image_cell: Dict, caption_cells: List[Dict]) -> str:
-
-        image = image_cell.get('image', None)
+    def extract_single_image_caption(
+        self, image_cell: Dict, caption_cells: List[Dict]
+    ) -> str:
+        image = image_cell.get("image", None)
         if image is None:
             return None
-        image_bbox = image_cell['bbox']
+        image_bbox = image_cell["bbox"]
         image_left, image_top, image_right, image_bottom = image_bbox
         image_width = image_right - image_left
         image_height = image_bottom - image_top
@@ -420,10 +459,10 @@ class DotsOCRImageParser:
             return None
         caption_candidates = []
         for caption_cell in caption_cells:
-            caption = caption_cell.get('md_content', None)
+            caption = caption_cell.get("md_content", None)
             if caption is None:
                 continue
-            caption_bbox = caption_cell['bbox']
+            caption_bbox = caption_cell["bbox"]
             distance, relation = self._rect_metrics(image_bbox, caption_bbox)
             # 方向权重
             distance_weight = {
@@ -438,13 +477,9 @@ class DotsOCRImageParser:
 
             # 打分
             if relation in ["left", "right"]:
-                distance = distance / (
-                    image_width / 2
-                )  # 水平距离相对于图像宽度归一化
+                distance = distance / (image_width / 2)  # 水平距离相对于图像宽度归一化
             else:
-                distance = distance / (
-                    image_height / 2
-                )  # 垂直距离相对于图像高度归一化
+                distance = distance / (image_height / 2)  # 垂直距离相对于图像高度归一化
             score = distance * distance_weight
 
             caption_candidates.append(
@@ -504,31 +539,16 @@ def main():
     parser = argparse.ArgumentParser(
         description="dots.ocr Multilingual Document Layout Parser",
     )
+    parser.add_argument("input_path", type=str, help="Input PDF/image file path")
+
     parser.add_argument(
-        "input_path", type=str,
-        help="Input PDF/image file path"
-    )
-    
-    parser.add_argument(
-        "--output", type=str, default="./output",
-        help="Output directory (default: ./output)"
+        "--output",
+        type=str,
+        default="./output",
+        help="Output directory (default: ./output)",
     )
     args = parser.parse_args()
 
-    # dots_ocr_parser = DotsOCRParser(
-    #     ip=args.ip,
-    #     port=args.port,
-    #     model_name=args.model_name,
-    #     temperature=args.temperature,
-    #     top_p=args.top_p,
-    #     max_completion_tokens=args.max_completion_tokens,
-    #     num_thread=args.num_thread,
-    #     dpi=args.dpi,
-    #     output_dir=args.output, 
-    #     min_pixels=args.min_pixels,
-    #     max_pixels=args.max_pixels,
-    #     use_hf=args.use_hf,
-    # )
     dots_ocr_parser = DotsOCRParser(
         ip="localhost",
         port=8000,
@@ -538,7 +558,7 @@ def main():
         max_completion_tokens=16384,
         num_thread=16,
         dpi=300,
-        output_dir="./output", 
+        output_dir="./output",
         min_pixels=None,
         max_pixels=None,
         use_hf=False,
@@ -546,55 +566,57 @@ def main():
 
     fitz_preprocess = True
     if fitz_preprocess:
-        print(f"Using fitz preprocess for image input, check the change of the image pixels")
+        print(
+            "Using fitz preprocess for image input, check the change of the image pixels"
+        )
     results = dots_ocr_parser.parse_file(
         args.input_path,
         prompt_mode="prompt_layout_only_en",
         bbox=None,
         fitz_preprocess=fitz_preprocess,
-        )
-    
+    )
+
     # post process to keep only picture and caption for easy visualization
     for result in results:
-        if 'cells' in result:
-            result['cells'] = [
+        if "cells" in result:
+            result["cells"] = [
                 {
-                    'page_no': result['page_no'],
-                    'category': cell.get('category'),
-                    'bbox': cell.get('bbox'),
-                    'image': cell.get('image')
+                    "page_no": result["page_no"],
+                    "category": cell.get("category"),
+                    "bbox": cell.get("bbox"),
+                    "image": cell.get("image"),
                 }
-                for cell in result['cells']
-                if cell.get('category') in ['Picture', 'Caption']
+                for cell in result["cells"]
+                if cell.get("category") in ["Picture", "Caption"]
             ]
         else:
-            result['cells'] = []
+            result["cells"] = []
     # print(results)
     # 类别为Caption的进行ocr
     for result in results:
-        for cell in result['cells']:
-            if cell['category'] == 'Caption':
-                image = cell['image']
+        for cell in result["cells"]:
+            if cell["category"] == "Caption":
+                image = cell["image"]
                 ocr_results = dots_ocr_parser.parse_image(
-                    image, 
+                    image,
                     prompt_mode="prompt_ocr",
                     bbox=None,
                     fitz_preprocess=fitz_preprocess,
-                    )
-                md_content = ocr_results[0].get('md_content', '')
-                print(f"page: {result['page_no']+1}, caption: {md_content}")
-                cell['md_content'] = md_content
+                )
+                md_content = ocr_results[0].get("md_content", "")
+                print(f"page: {result['page_no'] + 1}, caption: {md_content}")
+                cell["md_content"] = md_content
     # print(results)
     dots_ocr_image_parser = DotsOCRImageParser()
     image_info = dots_ocr_image_parser.extract_image_captions(results).get_result()
 
     os.makedirs(args.output, exist_ok=True)
     for image_item in image_info:
-        image_base64 = image_item.pop('image_base64')
+        image_base64 = image_item.pop("image_base64")
         image_bytes = base64.b64decode(image_base64)
-        image_name = image_item.pop('image_name')
+        image_name = image_item.pop("image_name")
         image_path = os.path.join(args.output, image_name)
-        with open(image_path, 'wb') as f:
+        with open(image_path, "wb") as f:
             f.write(image_bytes)
 
 
