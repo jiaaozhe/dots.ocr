@@ -1,15 +1,16 @@
 import os
-from tqdm import tqdm
-from multiprocessing.pool import ThreadPool
-import argparse
-
-import base64
-import re
-import unicodedata
-import hashlib
-from typing import List, Dict
 import io
+import re
+import base64
+import hashlib
+import argparse
+import unicodedata
+from tqdm import tqdm
+from typing import List, Dict
+from multiprocessing.pool import ThreadPool
+from PIL import Image
 
+import fitz
 
 from dots_ocr.model.inference import inference_with_vllm
 from dots_ocr.utils.consts import image_extensions, MIN_PIXELS, MAX_PIXELS
@@ -38,7 +39,6 @@ class DotsOCRParser:
         max_completion_tokens=16384,
         num_thread=64,
         dpi=200,
-        output_dir="./output",
         min_pixels=None,
         max_pixels=None,
         use_hf=False,
@@ -54,7 +54,6 @@ class DotsOCRParser:
         self.top_p = top_p
         self.max_completion_tokens = max_completion_tokens
         self.num_thread = num_thread
-        self.output_dir = output_dir
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
 
@@ -201,7 +200,7 @@ class DotsOCRParser:
         else:
             response = self._inference_with_vllm(image, prompt)
         result = {
-            "page_no": page_idx,
+            "page_idx": page_idx,
             "input_height": input_height,
             "input_width": input_width,
             "image": image,
@@ -288,7 +287,7 @@ class DotsOCRParser:
                     results.append(result)
                     pbar.update(1)
 
-        results.sort(key=lambda x: x["page_no"])
+        results.sort(key=lambda x: x["page_idx"])
         # for i in range(len(results)):
         #     results[i]['file_path'] = input_path
         return results
@@ -300,11 +299,9 @@ class DotsOCRParser:
         bbox=None,
         fitz_preprocess=False,
     ):
-        # output_dir = output_dir or self.output_dir
-        # output_dir = os.path.abspath(output_dir)
+
         filename, file_ext = os.path.splitext(os.path.basename(input_path))
-        # save_dir = os.path.join(output_dir, filename)
-        # os.makedirs(save_dir, exist_ok=True)
+
 
         if file_ext == ".pdf":
             results = self.parse_pdf(input_path, prompt_mode)
@@ -323,33 +320,233 @@ class DotsOCRParser:
         pass
 
 
-class DotsOCRImageParser:
-    def __init__(self):
-        self.image_info = []
+# class DotsOCRLayoutParser:
+#     def __init__(self):
+#         pass
+
+#     def __call__(self, pdf_path: str):
+
+    
+
+
+class DotsOCRImageInfoParser:
+    """
+    从 PDF 文件中提取图像及其对应的图注
+    """
+    
+    def __init__(self, pdf_path: str):
+        self.pdf_path = pdf_path
+        self.fitz_doc = fitz.open(pdf_path)
+        self.layout_info = []
+        # self.layout_info example:
+        # [
+        #     {"page_idx": 0, "cells": [{"category": "Picture", "bbox": [1, 2, 3, 4], "image": Image}, ...]},
+        #     ...
+        # ]
+        self.DPI = 300
+        self.dots_ocr_parser = DotsOCRParser(
+            ip="localhost",
+            port=8000,
+            model_name="model",
+            temperature=0.1,
+            top_p=1.0,
+            max_completion_tokens=16384,
+            num_thread=16,
+            dpi=self.DPI,
+            min_pixels=None,
+            max_pixels=None,
+            use_hf=False,
+        )
+        self.fitz_preprocess = True
+    
+    def __call__(self):
+        self.layout_parse()
+        self.extract_captions()
+        self.extract_image_captions()
+        return self.get_result()
+
+    def get_result(self):
+        image_info = []
+        for page_result in self.layout_info:
+            page_idx = page_result.get("page_idx", 0)
+            cells = page_result.get("cells", [])
+            for cell in cells:
+                if cell.get("category") == "Picture":
+                    image = cell.get("image", None)
+                    caption = cell.get("caption", "")
+                    if image is None:
+                        continue
+                    image_ext = image.format.lower() if image.format else "png"
+                    buffer = io.BytesIO()
+                    image.save(buffer, format=image_ext.upper())
+                    image_bytes = buffer.getvalue()
+                    image_md5 = hashlib.md5(image.tobytes()).hexdigest()
+                    safe_image_name = self.safe_filename(f"page_{page_idx+1}_{image_md5}.{image_ext}")
+                    image_info.append(
+                        {
+                            "page_idx": page_idx + 1,
+                            "image_name": safe_image_name,
+                            "image_md5": image_md5,
+                            "image_base64": base64.b64encode(image_bytes).decode("utf-8"),
+                            "caption": caption if caption else "",
+                        }
+                    )
+        return image_info
 
     def safe_filename(self, name: str) -> str:
         # 把不允许的字符替换成下划线
         return re.sub(r'[\/:*?"<>|]', "_", name)
+    
+    def extract_captions(self):
+        """
+        根据layout_parse的结果，提取图注
+        1. 先用fitz提取
+        2. 如果fitz提取的文本为空，则用OCR提取
+        """
+        for page_idx in range(len(self.layout_info)):
+            result = self.layout_info[page_idx]
+            cells = result.get("cells", [])
+            for idx in range(len(cells)):
+                cell = cells[idx]
+                if cell.get("category") == "Caption":
+                    cells[idx] = self.get_image_caption_with_fitz(page_idx, cell)
+        return self
+    
+    def get_image_caption_with_ocr(self, page_idx, caption_cell):
+        """
+        根据caption的bbox，使用ocr大模型提取对应区域的文字
+        """
+        caption_image = caption_cell.get("image", None)
+        if caption_image is None:
+            return caption_cell
 
-    def get_result(self):
-        # return self.image_info
-        for item in self.image_info:
-            pillow_image = item.pop("image")
-            image_ext = pillow_image.format.lower() if pillow_image.format else "png"
-            buffer = io.BytesIO()
-            pillow_image.save(buffer, format=image_ext.upper())
-            image_bytes = buffer.getvalue()
-            item["image_base64"] = base64.b64encode(image_bytes).decode("utf-8")
-            item["page_index"] = item.pop("page_no") + 1
-            item["image_md5"] = hashlib.md5(pillow_image.tobytes()).hexdigest()
-            item["image_name"] = (
-                f"page_{item['page_index']}_{self.safe_filename(item['caption'])}_{item['image_md5']}.{image_ext}"
+        output = self.dots_ocr_parser.parse_image(
+            caption_image,
+            prompt_mode="prompt_ocr",
+            bbox=None,
+            fitz_preprocess=self.fitz_preprocess,
+        )
+        text = output[0].get("md_content", "").strip()
+        caption_cell["text"] = self.clean_captions(text)
+        return caption_cell
+
+    def get_image_caption_with_fitz(self, page_idx, caption_cell):
+        """
+        根据caption的bbox，使用fitz提取对应区域的文字
+        """
+        caption_bbox = caption_cell["bbox"]
+        page = self.fitz_doc[page_idx]
+        scale = self.DPI / 72
+        x0, y0, x1, y1 = [coord / scale for coord in caption_bbox]
+        text_bbox = (x0, y0, x1, y1)
+        rect = fitz.Rect(text_bbox)
+        text = page.get_text("text", clip=rect).strip()
+        text = self.clean_captions(text, text_bbox)
+        caption_cell["text"] = text
+        # 如果文本为空，需要走OCR
+        if text == "":
+            caption_cell = self.get_image_caption_with_ocr(page_idx, caption_cell)
+        return caption_cell
+    
+    def layout_parse(self):
+        self.layout_info = self.dots_ocr_parser.parse_file(
+            self.pdf_path,
+            prompt_mode="prompt_layout_only_en",
+            bbox=None,
+            fitz_preprocess=self.fitz_preprocess,
+        )
+        return self
+
+    def extract_image_captions(self):
+        """
+        从results中提取图像及其对应的图注
+        """
+        for result in self.layout_info:
+            if "cells" in result:
+                cells = result["cells"]
+                self.extract_single_page_image_captions(cells)
+        return self
+
+    def extract_single_page_image_captions(self, cells):
+        """
+        从cells中提取图像及其对应的图注，更新self.layout_info
+        """
+        image_cells = [cell for cell in cells if cell.get("category") == "Picture"]
+        caption_cells = [cell for cell in cells if cell.get("category") == "Caption"]
+        for image_cell in image_cells:
+            caption = self.extract_single_image_caption(image_cell, caption_cells)
+            if caption:
+                image_cell["caption"] = caption
+
+    def extract_single_image_caption(
+        self, image_cell: Dict, caption_cells: List[Dict]
+    ) -> str:
+        image = image_cell.get("image", None)
+        if image is None:
+            return None
+        image_bbox = image_cell["bbox"]
+        image_left, image_top, image_right, image_bottom = image_bbox
+        image_width = image_right - image_left
+        image_height = image_bottom - image_top
+        if image_width <= 50 or image_height <= 50:
+            # 过滤掉过小的图片
+            return None
+        if min(image_width, image_height) / max(image_width, image_height) < 0.2:
+            # 过滤掉过于狭长的图片
+            return None
+        caption_candidates = []
+        for caption_cell in caption_cells:
+            caption = caption_cell.get("text", None)
+            if caption is None:
+                continue
+            caption_bbox = caption_cell["bbox"]
+            distance, relation = self._rect_metrics(image_bbox, caption_bbox)
+            # 方向权重
+            distance_weight = {
+                "below_center": 1.1,
+                "below_offside": 1.2,
+                "overlap": 1.2,
+                "left": 1.2,
+                "right": 1.2,
+                "above_center": 1.1,
+                "above_offside": 2,
+            }.get(relation, 10)
+
+            # 打分
+            if relation in ["left", "right"]:
+                distance = distance / (image_width / 2)  # 水平距离相对于图像宽度归一化
+            else:
+                distance = distance / (image_height / 2)  # 垂直距离相对于图像高度归一化
+            score = distance * distance_weight
+
+            caption_candidates.append(
+                {
+                    "caption": caption,
+                    "bbox": caption_bbox,
+                    "relation": relation,
+                    "score": score,
+                }
             )
-
-        return self.image_info
+        # 如果没有找到任何图注，返回空字符串
+        if not caption_candidates:
+            return None
+        # 按距离评分排序，选择最合适的图注
+        caption_candidates.sort(key=lambda x: x["score"])
+        # 只返回距离图像较近的图注（在合理范围内）
+        closest_caption = caption_candidates[0]
+        # 设置距离阈值（页面高度的25%）
+        distance_threshold = 1.3
+        if closest_caption["score"] <= distance_threshold:
+            # 生成坐标信息字符串
+            # coord_info = f"position: {closest_caption['relation']})"
+            return closest_caption["caption"]
+        else:
+            return None
 
     def _rect_metrics(self, image_bbox, text_bbox):
-        """计算矩形关系与距离"""
+        """
+        计算图像bbox和文本bbox的距离和方向关系
+        """
         image_left, image_top, image_right, image_bottom = image_bbox
         text_left, text_top, text_right, text_bottom = text_bbox
 
@@ -416,141 +613,51 @@ class DotsOCRImageParser:
 
         return distance, relation
 
-    def extract_image_captions(self, results):
-        """
-        从results中提取图像及其对应的图注
-        """
-        for result in results:
-            if "cells" in result:
-                cells = result["cells"]
-                image_cells = self.extract_single_page_image_captions(cells)
-                self.image_info.extend(image_cells)
-        return self
-
-    def extract_single_page_image_captions(self, cells):
-        """
-        从cells中提取图像及其对应的图注
-        """
-        new_image_cells = []
-        image_cells = [cell for cell in cells if cell.get("category") == "Picture"]
-        caption_cells = [cell for cell in cells if cell.get("category") == "Caption"]
-        for image_cell in image_cells:
-            caption = self.extract_single_image_caption(image_cell, caption_cells)
-            if caption:
-                image_cell["caption"] = caption
-                new_image_cells.append(image_cell)
-        return new_image_cells
-
-    def extract_single_image_caption(
-        self, image_cell: Dict, caption_cells: List[Dict]
-    ) -> str:
-        image = image_cell.get("image", None)
-        if image is None:
-            return None
-        image_bbox = image_cell["bbox"]
-        image_left, image_top, image_right, image_bottom = image_bbox
-        image_width = image_right - image_left
-        image_height = image_bottom - image_top
-        if image_width <= 50 or image_height <= 50:
-            # 过滤掉过小的图片
-            return None
-        if min(image_width, image_height) / max(image_width, image_height) < 0.2:
-            # 过滤掉过于狭长的图片
-            return None
-        caption_candidates = []
-        for caption_cell in caption_cells:
-            caption = caption_cell.get("md_content", None)
-            if caption is None:
-                continue
-            caption_bbox = caption_cell["bbox"]
-            distance, relation = self._rect_metrics(image_bbox, caption_bbox)
-            # 方向权重
-            distance_weight = {
-                "below_center": 1.1,
-                "below_offside": 1.2,
-                "overlap": 1.2,
-                "left": 1.2,
-                "right": 1.2,
-                "above_center": 1.1,
-                "above_offside": 2,
-            }.get(relation, 10)
-
-            # 打分
-            if relation in ["left", "right"]:
-                distance = distance / (image_width / 2)  # 水平距离相对于图像宽度归一化
-            else:
-                distance = distance / (image_height / 2)  # 垂直距离相对于图像高度归一化
-            score = distance * distance_weight
-
-            caption_candidates.append(
-                {
-                    "caption": caption,
-                    "bbox": caption_bbox,
-                    "relation": relation,
-                    "score": score,
-                }
-            )
-        # 如果没有找到任何图注，返回空字符串
-        if not caption_candidates:
-            return None
-        # 按距离评分排序，选择最合适的图注
-        caption_candidates.sort(key=lambda x: x["score"])
-        # 只返回距离图像较近的图注（在合理范围内）
-        closest_caption = caption_candidates[0]
-        # 设置距离阈值（页面高度的25%）
-        distance_threshold = 1.3
-        if closest_caption["score"] <= distance_threshold:
-            # 生成坐标信息字符串
-            # coord_info = f"position: {closest_caption['relation']})"
-            return closest_caption["caption"]
-        else:
-            return None
-
-    def clean_pdf_captions(self, text: str) -> str:
+    def clean_captions(self, text: str, bbox=None) -> str:
         """
         清理从 PDF 提取的图注：
         1. 把各种 Unicode 空格（全角空格、em space、en space 等）统一为半角空格
         2. 去掉零宽字符（如 \u200b, \u200c, \u200d）
         3. 去掉控制符（如 \u2028, \u2029）
         4. 合并连续空格为一个
+        5. 去掉私有区符号（\ue000-\uf8ff）
+        6. 规范化“图”字与编号之间的空格
+        7. 根据 bbox 判断横排或竖排，竖排去换行拼接，横排去多余空格
         """
         cleaned = []
         for ch in text:
             cat = unicodedata.category(ch)
             if cat == "Zs":
-                # 所有空格类 → 统一成普通半角空格
                 cleaned.append(" ")
             elif ch in ["\u200b", "\u200c", "\u200d", "\ufeff"]:
-                # 零宽空格、BOM → 丢弃
                 continue
             elif ch in ["\u2028", "\u2029"]:
-                # 行分隔符、段落分隔符 → 统一成换行
                 cleaned.append("\n")
             else:
                 cleaned.append(ch)
 
-        result = "".join(cleaned)
-        # 合并多余空格
-        result = re.sub(r"[ ]{2,}", " ", result)
-        return result.strip()
+        text = "".join(cleaned)
+        text = re.sub(r"[ ]{2,}", " ", text)
+        text = re.sub(r'[\ue000-\uf8ff]', '', text)
+        text = re.sub(r'图\s*([一二三四五六七八九十\d]+)', r'图\1', text)
 
+        if bbox is not None:
+            x0, y0, x1, y1 = bbox
+            width = x1 - x0
+            height = y1 - y0
+            if height > width * 4:  # 竖排
+                return text.replace("\n", "").replace(" ", "")
+            else:  # 横排
+                return " ".join(text.split())
+        return text.strip()
 
-def clean_caption(text: str, bbox) -> str:
-    x0, y0, x1, y1 = bbox
-    width = x1 - x0
-    height = y1 - y0
-    text = re.sub(r'[\ue000-\uf8ff]', '', text)
-    text = re.sub(r'图\s*([一二三四五六七八九十\d]+)', r'图\1', text)
+    def __del__(self):
+        """清理资源，防止内存泄漏"""
+        if hasattr(self, 'fitz_doc') and self.fitz_doc:
+            self.fitz_doc.close()
+        # 清理大型对象引用
+        self.layout_info = []
 
-    # 判断横排 or 竖排
-    if height > width * 4:  # 竖排
-        # 去掉换行、空格，拼成一行
-        clean_text = text.replace("\n", "").replace(" ", "")
-        return clean_text
-    else:  # 横排
-        # 去掉多余空格
-        clean_text = " ".join(text.split())
-        return clean_text
 
 def main():
     parser = argparse.ArgumentParser(
@@ -599,7 +706,7 @@ def main():
         if "cells" in result:
             result["cells"] = [
                 {
-                    "page_no": result["page_no"],
+                    "page_idx": result["page_idx"],
                     "category": cell.get("category"),
                     "bbox": cell.get("bbox"),
                     "image": cell.get("image"),
@@ -610,10 +717,10 @@ def main():
         else:
             result["cells"] = []
     
-    import fitz
+    
     doc = fitz.open(args.input_path)
     scale = DPI / 72
-    file_name = os.path.basename(args.input_path).split(".")[0]
+
     for page_index in range(len(doc)):
         page = doc[page_index]
         result = results[page_index]
@@ -631,7 +738,15 @@ def main():
                 print("*" * 100)
 
                 continue
-            print(f"Page {page_index+1} Caption: {clean_caption(text, text_bbox)}, x0: {x0}, y0: {y0}, x1: {x1}, y1: {y1}, 面积：{area}")
+            # print(f"Page {page_index+1} Caption: {clean_caption(text, text_bbox)}, x0: {x0}, y0: {y0}, x1: {x1}, y1: {y1}, 面积：{area}")
 
 if __name__ == "__main__":
-    main()
+    # main()
+    import sys
+    pdf_path = sys.argv[1]
+    parser = DotsOCRImageInfoParser(pdf_path)
+    results = parser()
+    import json
+    # save to file
+    with open("image_captions.json", "w") as f:
+        json.dump(results, f, ensure_ascii=False, indent=4)
