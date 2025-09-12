@@ -3,6 +3,7 @@ import io
 import re
 import base64
 import hashlib
+import requests
 import argparse
 import unicodedata
 from tqdm import tqdm
@@ -11,10 +12,11 @@ from multiprocessing.pool import ThreadPool
 from PIL import Image
 
 import fitz
+from openai import OpenAI
 
-from dots_ocr.model.inference import inference_with_vllm
+# from dots_ocr.model.inference import inference_with_vllm
 from dots_ocr.utils.consts import image_extensions, MIN_PIXELS, MAX_PIXELS
-from dots_ocr.utils.image_utils import get_image_by_fitz_doc, fetch_image, smart_resize
+from dots_ocr.utils.image_utils import get_image_by_fitz_doc, fetch_image, smart_resize, PILimage_to_base64
 from dots_ocr.utils.doc_utils import load_images_from_pdf
 from dots_ocr.utils.prompts import dict_promptmode_to_prompt
 from dots_ocr.utils.layout_utils import (
@@ -22,6 +24,46 @@ from dots_ocr.utils.layout_utils import (
     pre_process_bboxes,
 )
 from dots_ocr.utils.format_transformer import layoutjson2md
+
+
+def inference_with_vllm(
+        image,
+        prompt, 
+        ip="localhost",
+        port=8000,
+        temperature=0.1,
+        top_p=0.9,
+        max_completion_tokens=32768,
+        model_name='model',
+        ):
+    
+    addr = f"http://{ip}:{port}/v1"
+    client = OpenAI(api_key="{}".format(os.environ.get("API_KEY", "0")), base_url=addr)
+    messages = []
+    messages.append(
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url":  PILimage_to_base64(image)},
+                },
+                {"type": "text", "text": f"<|img|><|imgpad|><|endofimg|>{prompt}"}  # if no "<|img|><|imgpad|><|endofimg|>" here,vllm v1 will add "\n" here
+            ],
+        }
+    )
+    try:
+        response = client.chat.completions.create(
+            messages=messages, 
+            model=model_name, 
+            max_completion_tokens=max_completion_tokens,
+            temperature=temperature,
+            top_p=top_p)
+        response = response.choices[0].message.content
+        return response
+    except requests.exceptions.RequestException as e:
+        print(f"request error: {e}")
+        return None
 
 
 class DotsOCRParser:
@@ -320,21 +362,17 @@ class DotsOCRParser:
         pass
 
 
-# class DotsOCRLayoutParser:
-#     def __init__(self):
-#         pass
-
-#     def __call__(self, pdf_path: str):
-
-    
-
-
-class DotsOCRImageInfoParser:
+class PDFImageInfoParser:
     """
     从 PDF 文件中提取图像及其对应的图注
     """
     
     def __init__(self, pdf_path: str):
+        """
+        Args:
+            pdf_path: PDF 文件路径
+            use_origin_image: 是否使用fitz库从原始pdf中提取图像，默认使用检测出来的图像bbox区域裁切获得图像
+        """
         self.pdf_path = pdf_path
         self.fitz_doc = fitz.open(pdf_path)
         self.layout_info = []
@@ -343,6 +381,7 @@ class DotsOCRImageInfoParser:
         #     {"page_idx": 0, "cells": [{"category": "Picture", "bbox": [1, 2, 3, 4], "image": Image}, ...]},
         #     ...
         # ]
+        # dotsocr model init
         self.DPI = 300
         self.dots_ocr_parser = DotsOCRParser(
             ip="localhost",
@@ -358,6 +397,10 @@ class DotsOCRImageInfoParser:
             use_hf=False,
         )
         self.fitz_preprocess = True
+        # paddle ocr model init
+        from paddleocr import LayoutDetection
+        self.paddle_layout_detection_model_name = "PP-DocLayout_plus-L"
+        self.paddle_layout_detection_model = LayoutDetection(model_name=self.paddle_layout_detection_model_name)
     
     def __call__(self):
         self.layout_parse()
@@ -434,27 +477,75 @@ class DotsOCRImageInfoParser:
         """
         根据caption的bbox，使用fitz提取对应区域的文字
         """
-        caption_bbox = caption_cell["bbox"]
+        text_bbox = caption_cell["bbox"]
         page = self.fitz_doc[page_idx]
-        scale = self.DPI / 72
-        x0, y0, x1, y1 = [coord / scale for coord in caption_bbox]
-        text_bbox = (x0, y0, x1, y1)
         rect = fitz.Rect(text_bbox)
         text = page.get_text("text", clip=rect).strip()
         text = self.clean_captions(text, text_bbox)
         caption_cell["text"] = text
         # 如果文本为空，需要走OCR
-        if text == "":
-            caption_cell = self.get_image_caption_with_ocr(page_idx, caption_cell)
+        # if text == "":
+        #     caption_cell = self.get_image_caption_with_ocr(page_idx, caption_cell)
         return caption_cell
     
     def layout_parse(self):
+        self.paddle_ocr_layout_parse()
+        # self.dots_ocr_layout_parse()
+    
+    def paddle_ocr_layout_parse(self):
+        category_map = {
+            "image": "Picture",
+            "figure_title": "Caption",
+        }
+        output = self.paddle_layout_detection_model.predict_iter("/home/jiaaozhe/project/museum_agent/OCR/PaddleOCR/北魏铜鎏金释迦牟尼佛坐像管窥_邢鹏.pdf", batch_size=1, layout_nms=True)
+        self.layout_info = []
+        for res in output:
+            # res.print()
+            # res.save_to_img(save_path=f"./output/{model_name}/")
+            # res.save_to_json(save_path=f"./output/{model_name}/res.json")
+            pillow_image = res.img['res']
+            width, height = pillow_image.size
+            page_layout_info = []
+            for lable_info in res.json['res']['boxes']:
+                category = lable_info['label']
+                if category in ['image', "figure_title"]:
+                    bbox = lable_info['coordinate']
+                    ocr_image = pillow_image.crop((bbox[0], bbox[1], bbox[2], bbox[3]))
+                    # 对齐bbox尺度到pdf
+                    bbox = [coord / 2 for coord in bbox] # paddleocr默认对图像进行两倍放缩
+                    category = category_map[category]
+                    #从pdf原始页面中根据bbox提取图像，替换ocr_image
+                    # if self.use_origin_image:
+                    page = self.fitz_doc[res.json['res']['page_index']]
+                    rect = fitz.Rect(bbox)
+                    mat = fitz.Matrix(2, 2)  # no zoom
+                    pix = page.get_pixmap(matrix=mat, clip=rect, alpha=False)
+                    img_data = pix.tobytes("png")
+                    ocr_image = Image.open(io.BytesIO(img_data)).convert("RGB") 
+                    page_layout_info.append({'category': category, 'bbox': bbox, 'image': ocr_image})
+            self.layout_info.append(
+                {
+                    "page_idx": res.json['res']['page_index'],
+                    "image": pillow_image,
+                    "cells": page_layout_info
+                }
+            )
+    
+    def dots_ocr_layout_parse(self):
         self.layout_info = self.dots_ocr_parser.parse_file(
             self.pdf_path,
             prompt_mode="prompt_layout_only_en",
             bbox=None,
             fitz_preprocess=self.fitz_preprocess,
         )
+        # 对齐bbox尺度
+        for result in self.layout_info:
+            if "cells" in result:
+                cells = result["cells"]
+                for cell in cells:
+                    bbox = cell["bbox"]
+                    scale = self.DPI / 72
+                    cell["bbox"] = [coord / scale for coord in bbox]
         return self
 
     def extract_image_captions(self):
@@ -744,9 +835,35 @@ if __name__ == "__main__":
     # main()
     import sys
     pdf_path = sys.argv[1]
-    parser = DotsOCRImageInfoParser(pdf_path)
+    parser = PDFImageInfoParser(pdf_path)
     results = parser()
     import json
     # save to file
     with open("image_captions.json", "w") as f:
         json.dump(results, f, ensure_ascii=False, indent=4)
+    
+    layout_info = parser.layout_info
+    # 保存layout_info中的所有图像
+    for page_result in layout_info:
+        page_idx = page_result.get("page_idx", 0)
+        cells = page_result.get("cells", [])
+        for cell in cells:
+            if cell.get("category") == "Picture":
+                image = cell.get("image", None)
+                caption = cell.get("caption", "")
+                if image is None:
+                    continue
+                image_ext = image.format.lower() if image.format else "png"
+                image_md5 = hashlib.md5(image.tobytes()).hexdigest()
+                safe_image_name = parser.safe_filename(f"page_{page_idx+1}_{caption}_{image_md5}.{image_ext}")
+                image.save(safe_image_name)
+            # elif cell.get("category") == "Caption":
+            #     image = cell.get("image", None)
+            #     text = cell.get("text", "")
+            #     if image is None:
+            #         continue
+            #     image_ext = image.format.lower() if image.format else "png"
+            #     image_md5 = hashlib.md5(image.tobytes()).hexdigest()
+            #     safe_image_name = parser.safe_filename(f"caption_image_{page_idx+1}_caption_{text}_{image_md5}.{image_ext}")
+            #     image.save(safe_image_name)
+
